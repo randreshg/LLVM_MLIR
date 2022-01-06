@@ -32,7 +32,6 @@ static double NumVal;              // Filled in if tok_number
 // gettok - Return the next token from standard input.
 static int gettok() {
     static int LastChar = ' ';
-
     // Skip any whitespace.
     while (isspace(LastChar))
         LastChar = getchar();
@@ -41,7 +40,6 @@ static int gettok() {
         IdentifierStr = LastChar;
         while (isalnum((LastChar = getchar())))
             IdentifierStr += LastChar;
-
         if (IdentifierStr == "def") return tok_def;
         if (IdentifierStr == "extern") return tok_extern;
         return tok_identifier;
@@ -79,8 +77,8 @@ static int gettok() {
 
 //===----------------------------------------------------------------------===//
 /*  ABSTRACT SYNTAX TREE
-    The AST for a program captures its behavior in such a way that it is easy for later 
-    stages of the compiler (e.g. code generation) to interpret. 
+    The AST for a program captures its behavior in such a way that it is easy for 
+    later stages of the compiler (e.g. code generation) to interpret. 
 */
 //===----------------------------------------------------------------------===//
 // ExprAST - Base class for all expression nodes.
@@ -141,9 +139,141 @@ class FunctionAST {
             : Proto(proto), Body(body) {}
 };
 
-// int main () {
-//     while (true) {
-//         int tok = gettok();
-//         std::cout<< "go token: " << tok << std::endl;
-//     }
-// }
+//===----------------------------------------------------------------------===//
+/*  PARSER
+    The idea here is that we want to parse something like “x+y” (which is 
+    returned as three tokens by the lexer) into an AST that could be generated 
+    with calls
+*/
+//===----------------------------------------------------------------------===//
+/*  CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+    token the parser is looking at.  getNextToken reads another token from the
+    lexer and updates CurTok with its results.
+*/
+static int CurTok;
+static int getNextToken() {
+    return CurTok = gettok();
+}
+/// Error* - These are little helper functions for error handling.
+ExprAST *Error(const char *Str) { fprintf(stderr, "Error: %s\n", Str);return 0;}
+PrototypeAST *ErrorP(const char *Str) { Error(Str); return 0; }
+FunctionAST *ErrorF(const char *Str) { Error(Str); return 0; }
+
+// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+    switch (CurTok) {
+        case '>':
+        case '<':
+            return 10;
+        case '+':
+        case '-':
+            return 20;
+        case '*':
+        case '/':
+            return 40;
+        default:
+            return -1;
+    }
+}
+
+// numberexpr ::= number
+static ExprAST *ParseNumberExpr() {
+    ExprAST *Result = new NumberExprAST(NumVal);
+    getNextToken(); // consume the number
+    return Result;
+}
+
+// parenexpr ::= '(' expression ')'
+static ExprAST *ParseParenExpr() {
+    getNextToken();  // eat (.
+    ExprAST *V = ParseExpression();
+    if (!V) return 0;
+    if (CurTok != ')') return Error("expected ')'");
+    getNextToken();  // eat ).
+    return V;
+}
+
+// identifierexpr
+//   ::= identifier
+//   ::= identifier '(' expression* ')'
+static ExprAST *ParseIdentifierOrCallExpr() {
+    std::string IdName = IdentifierStr;
+    getNextToken();  // eat identifier.
+    if (CurTok != '(') // Simple variable ref.
+        return new VariableExprAST(IdName);
+    // Call.
+    getNextToken();  // eat (
+    std::vector<ExprAST*> Args;
+    if (CurTok != ')') {
+        while (1) {
+            ExprAST *Arg = ParseExpression();
+            if (!Arg) return 0;
+            Args.push_back(Arg);
+
+            if (CurTok == ')') break;
+            if (CurTok != ',')
+                return Error("Expected ')' or ',' in argument list");
+            getNextToken();
+        }
+    }
+    getNextToken(); // Eat the ')'.
+    return new CallExprAST(IdName, Args);
+}
+
+// primary
+//   ::= identifierexpr
+//   ::= numberexpr
+//   ::= parenexpr
+static ExprAST *ParsePrimary() {
+    switch (CurTok) {
+        case tok_identifier: return ParseIdentifierOrCallExpr();
+        case tok_number:     return ParseNumberExpr();
+        case '(':            return ParseParenExpr();
+        default: return Error("unknown token when expecting an expression");
+    }
+}
+
+// binoprhs
+//   ::= ('+' primary)*
+static ExprAST *ParseBinOpRHS(int ExprPrec, ExprAST *LHS) {
+    // If this is a binop, find its precedence.
+    while (1) {
+        int TokPrec = GetTokPrecedence();
+        // If this is a binop that binds at least as tightly as the current binop,
+        // consume it, otherwise we are done.
+        if (TokPrec < ExprPrec) return LHS;
+        // Okay, we know this is a binop.
+        int BinOp = CurTok;
+        getNextToken();  // eat binop
+        // Parse the primary expression after the binary operator.
+        ExprAST *RHS = ParsePrimary();
+        if (!RHS) return 0;
+        // If BinOp binds less tightly with RHS than the operator after RHS, let
+        // the pending operator take RHS as its LHS.
+        int NextPrec = GetTokPrecedence();
+        if (TokPrec < NextPrec) {
+            RHS = ParseBinOpRHS(TokPrec+1, RHS);
+            if (RHS == 0) return 0;
+        }
+        // Merge LHS/RHS.
+        LHS = new BinaryExprAST(BinOp, LHS, RHS);
+    }
+}
+
+// expression
+//   ::= primary binoprhs
+//
+static ExprAST *ParseExpression() {
+    ExprAST *LHS = ParsePrimary();
+    if (!LHS) return 0;
+
+    return ParseBinOpRHS(0, LHS);
+}
+
+
+int main () {
+    // while (true) {
+    //     int tok = gettok();
+    //     std::cout<< "go token: " << tok << std::endl;
+    // }
+}
