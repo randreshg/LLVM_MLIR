@@ -1,3 +1,6 @@
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <iostream>
 #include <vector>
@@ -17,15 +20,6 @@ enum Token {
     // primary
     tok_identifier = -4, tok_number = -5,
 };
-/*
-    Each token returned by our lexer will either be one of the Token enum values or it will be 
-    an ‘unknown’ character like ‘+’, which is returned as its ASCII value. If the current token 
-    is an identifier, the IdentifierStr global variable holds the name of the identifier. 
-    If the current token is a numeric literal (like 1.0), NumVal holds its value.
-    
-    The actual implementation of the lexer is a single function named gettok. 
-    The gettok function is called to return the next token from standard input.
-*/
 static std::string IdentifierStr;  // Filled in if tok_identifier
 static double NumVal;              // Filled in if tok_number
 
@@ -154,7 +148,7 @@ static int CurTok;
 static int getNextToken() {
     return CurTok = gettok();
 }
-/// Error* - These are little helper functions for error handling.
+// Error* - These are little helper functions for error handling.
 ExprAST *Error(const char *Str) { fprintf(stderr, "Error: %s\n", Str);return 0;}
 PrototypeAST *ErrorP(const char *Str) { Error(Str); return 0; }
 FunctionAST *ErrorF(const char *Str) { Error(Str); return 0; }
@@ -191,33 +185,6 @@ static ExprAST *ParseParenExpr() {
     if (CurTok != ')') return Error("expected ')'");
     getNextToken();  // eat ).
     return V;
-}
-
-// identifierexpr
-//   ::= identifier
-//   ::= identifier '(' expression* ')'
-static ExprAST *ParseIdentifierOrCallExpr() {
-    std::string IdName = IdentifierStr;
-    getNextToken();  // eat identifier.
-    if (CurTok != '(') // Simple variable ref.
-        return new VariableExprAST(IdName);
-    // Call.
-    getNextToken();  // eat (
-    std::vector<ExprAST*> Args;
-    if (CurTok != ')') {
-        while (1) {
-            ExprAST *Arg = ParseExpression();
-            if (!Arg) return 0;
-            Args.push_back(Arg);
-
-            if (CurTok == ')') break;
-            if (CurTok != ',')
-                return Error("Expected ')' or ',' in argument list");
-            getNextToken();
-        }
-    }
-    getNextToken(); // Eat the ')'.
-    return new CallExprAST(IdName, Args);
 }
 
 // primary
@@ -266,14 +233,145 @@ static ExprAST *ParseBinOpRHS(int ExprPrec, ExprAST *LHS) {
 static ExprAST *ParseExpression() {
     ExprAST *LHS = ParsePrimary();
     if (!LHS) return 0;
-
     return ParseBinOpRHS(0, LHS);
 }
 
+// identifierexpr
+//   ::= identifier
+//   ::= identifier '(' expression* ')'
+static ExprAST *ParseIdentifierOrCallExpr() {
+    std::string IdName = IdentifierStr;
+    getNextToken();  // eat identifier.
+    if (CurTok != '(') // Simple variable ref.
+        return new VariableExprAST(IdName);
+    // Call.
+    getNextToken();  // eat (
+    std::vector<ExprAST*> Args;
+    if (CurTok != ')') {
+        while (1) {
+            ExprAST *Arg = ParseExpression();
+            if (!Arg) return 0;
+            Args.push_back(Arg);
+
+            if (CurTok == ')') break;
+            if (CurTok != ',')
+                return Error("Expected ')' or ',' in argument list");
+            getNextToken();
+        }
+    }
+    getNextToken(); // Eat the ')'.
+    return new CallExprAST(IdName, Args);
+}
+
+// prototype
+//   ::= id '(' id* ')'
+static PrototypeAST *ParsePrototype() {
+    if (CurTok != tok_identifier)
+        return ErrorP("Expected function name in prototype");
+
+    std::string FnName = IdentifierStr;
+    getNextToken();
+
+    if (CurTok != '(')
+        return ErrorP("Expected '(' in prototype");
+
+    // Read the list of argument names.
+    std::vector<std::string> ArgNames;
+    while (getNextToken() == tok_identifier)
+        ArgNames.push_back(IdentifierStr);
+    if (CurTok != ')')
+        return ErrorP("Expected ')' in prototype");
+
+    // success.
+    getNextToken();  // eat ')'.
+
+    return new PrototypeAST(FnName, ArgNames);
+}
+
+// definition ::= 'def' prototype expression
+static FunctionAST *ParseDefinition() {
+    getNextToken();  // eat def.
+    PrototypeAST *Proto = ParsePrototype();
+    if (Proto == 0) return 0;
+
+    if (ExprAST *E = ParseExpression())
+        return new FunctionAST(Proto, E);
+    return 0;
+}
+
+// external ::= 'extern' prototype
+static PrototypeAST *ParseExtern() {
+    getNextToken();  // eat extern.
+    return ParsePrototype();
+}
+
+// toplevelexpr ::= expression
+static FunctionAST *ParseTopLevelExpr() {
+    if (ExprAST *E = ParseExpression()) {
+        // Make an anonymous proto.
+        PrototypeAST *Proto = new PrototypeAST("", std::vector<std::string>());
+        return new FunctionAST(Proto, E);
+    }
+    return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing
+//===----------------------------------------------------------------------===//
+
+static void HandleDefinition() {
+  if (ParseDefinition()) {
+    fprintf(stderr, "Parsed a function definition.\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (ParseExtern()) {
+    fprintf(stderr, "Parsed an extern\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (ParseTopLevelExpr()) {
+    fprintf(stderr, "Parsed a top-level expr\n");
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | ';'
+static void MainLoop() {
+    while (1) {
+        fprintf(stderr, "ready> ");
+        switch (CurTok) {
+        case tok_eof:    return;
+        case ';':        getNextToken(); break;  // ignore top-level semicolons.
+        case tok_def:    HandleDefinition(); break;
+        case tok_extern: HandleExtern(); break;
+        default:         HandleTopLevelExpression(); break;
+        }
+    }
+}
 
 int main () {
     // while (true) {
     //     int tok = gettok();
     //     std::cout<< "go token: " << tok << std::endl;
     // }
+    // Prime the first token.
+    fprintf(stderr, "ready> ");
+    getNextToken();
+
+    // Run the main "interpreter loop" now.
+    MainLoop();
+
+    return 0;
 }
