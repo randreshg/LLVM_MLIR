@@ -1,3 +1,4 @@
+//#include "../include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -6,11 +7,19 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -366,6 +375,11 @@ static std::unique_ptr<IRBuilder<>> Builder;
 // their LLVM representation is
 static std::map<std::string, Value *> NamedValues;
 
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
+//static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static ExitOnError ExitOnErr;
+
 Value *LogErrorV(const char *Str) {
     LogError(Str);
     return nullptr;
@@ -460,23 +474,40 @@ Function *FunctionAST::codegen() {
         Builder->CreateRet(RetVal);
         // Validate the generated code, checking for consistency.
         verifyFunction(*TheFunction);
+        // Run the optimizer on the function.
+        TheFPM->run(*TheFunction);
         return TheFunction;
     }
     // Error reading body, remove function.
     TheFunction->eraseFromParent();
     return nullptr;
 }
-//===----------------------------------------------------------------------===//
-// Top-Level parsing and JIT Driver
-//===----------------------------------------------------------------------===//
 
-static void InitializeModule() {
-  // Open a new context and module.
-  TheContext = std::make_unique<LLVMContext>();
-  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+//===----------------------------------------------------------------------===//
+// Top-Level parsing
+//===----------------------------------------------------------------------===//
+static void InitializeModuleAndPassManager() {
+    // Open a new context and module.
+    TheContext = std::make_unique<LLVMContext>();
+    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    //TheModule->setDataLayout(TheJIT->getDataLayout());
 
-  // Create a new builder for the module.
-  Builder = std::make_unique<IRBuilder<>>(*TheContext);
+    // Create a new builder for the module.
+    Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
+    // Create a new pass manager attached to it.
+    TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    // Do simple "peephole" optimizations and bit-twiddling optzns.
+    TheFPM->add(createInstructionCombiningPass());
+    // Reassociate expressions.
+    TheFPM->add(createReassociatePass());
+    // Eliminate Common SubExpressions.
+    TheFPM->add(createGVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc).
+    TheFPM->add(createCFGSimplificationPass());
+
+    TheFPM->doInitialization();
 }
 
 static void HandleDefinition() {
@@ -548,14 +579,13 @@ static void MainLoop() {
 //===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
-
 int main() {
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
 
   // Make the module, which holds all the code.
-  InitializeModule();
+  InitializeModuleAndPassManager();
 
   // Run the main "interpreter loop" now.
   MainLoop();
