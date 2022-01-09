@@ -1,4 +1,4 @@
-//#include "../include/KaleidoscopeJIT.h"
+#include "./KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -28,6 +28,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
 /*  LEXER
@@ -376,7 +377,7 @@ static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
 
 static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
-//static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 static ExitOnError ExitOnErr;
 
@@ -385,6 +386,16 @@ Value *LogErrorV(const char *Str) {
     return nullptr;
 }
 
+Function *getFunction(std::string Name) {
+    // First, see if the function has already been added to the current module.
+    if (auto *F = TheModule->getFunction(Name)) return F;
+    // If not, check whether we can codegen the declaration from some existing
+    // prototype.
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end()) return FI->second->codegen();
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
 // numeric constants
 Value *NumberExprAST::codegen() {
     return ConstantFP::get(*TheContext, APFloat(Val));
@@ -422,7 +433,7 @@ Value *BinaryExprAST::codegen() {
 // call
 Value *CallExprAST::codegen() {
     // Look up the name in the global module table.
-    Function *CalleeF = TheModule->getFunction(Callee);
+    Function *CalleeF = getFunction(Callee);
     if (!CalleeF) return LogErrorV("Unknown function referenced");
     // If argument mismatch error.
     if (CalleeF->arg_size() != Args.size())
@@ -455,11 +466,12 @@ Function *PrototypeAST::codegen() {
 
 // Function body
 Function *FunctionAST::codegen() {
-    // First, check for an existing function from a previous 'extern' declaration.
-    Function *TheFunction = TheModule->getFunction(Proto->getName());
-    if (!TheFunction) TheFunction = Proto->codegen();
+    // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+    // reference to it for use below.
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    Function *TheFunction = getFunction(P.getName());
     if (!TheFunction) return nullptr;
-    if (!TheFunction->empty()) return (Function*)LogErrorV("Function cannot be redefined.");
     // Create a new basic block to start insertion into.
     BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
     Builder->SetInsertPoint(BB);
@@ -490,7 +502,7 @@ static void InitializeModuleAndPassManager() {
     // Open a new context and module.
     TheContext = std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
-    //TheModule->setDataLayout(TheJIT->getDataLayout());
+    TheModule->setDataLayout(TheJIT->getDataLayout());
 
     // Create a new builder for the module.
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
@@ -513,9 +525,12 @@ static void InitializeModuleAndPassManager() {
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read function definition:");
+      fprintf(stderr, "Read function definition:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      ExitOnErr(TheJIT->addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext)));
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -529,6 +544,7 @@ static void HandleExtern() {
       fprintf(stderr, "Read extern: ");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     // Skip token for error recovery.
@@ -537,19 +553,31 @@ static void HandleExtern() {
 }
 
 static void HandleTopLevelExpression() {
-  // Evaluate a top-level expression into an anonymous function.
-  if (auto FnAST = ParseTopLevelExpr()) {
-    if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression:");
-      FnIR->print(errs());
-      fprintf(stderr, "\n");
+    // Evaluate a top-level expression into an anonymous function.
+    if (auto FnAST = ParseTopLevelExpr()) {
+        if (FnAST->codegen()) {
+            // Create a ResourceTracker to track JIT'd memory allocated to our
+            // anonymous expression -- that way we can free it after executing.
+            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
 
-      // Remove the anonymous expression.
-      FnIR->eraseFromParent();
-    }
-  } else {
-    // Skip token for error recovery.
-    getNextToken();
+            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            InitializeModuleAndPassManager();
+
+            // Search the JIT for the __anon_expr symbol.
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+            // Get the symbol's address and cast it to the right type (takes no
+            // arguments, returns a double) so we can call it as a native function.
+            double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            // Delete the anonymous expression module from the JIT.
+            ExitOnErr(RT->remove());
+        }
+  } 
+  else { // Skip token for error recovery.
+        getNextToken();
   }
 }
 
@@ -577,21 +605,48 @@ static void MainLoop() {
 }
 
 //===----------------------------------------------------------------------===//
+// "Library" functions that can be "extern'd" from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+  fprintf(stderr, "%f\n", X);
+  return 0;
+}
+//===----------------------------------------------------------------------===//
 // Main driver code.
 //===----------------------------------------------------------------------===//
 int main() {
-  // Prime the first token.
-  fprintf(stderr, "ready> ");
-  getNextToken();
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
 
-  // Make the module, which holds all the code.
-  InitializeModuleAndPassManager();
+    // Prime the first token.
+    fprintf(stderr, "ready> ");
+    getNextToken();
 
-  // Run the main "interpreter loop" now.
-  MainLoop();
+    // Initialize JIT
+    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+    // Make the module, which holds all the code.
+    InitializeModuleAndPassManager();
 
-  // Print out all of the generated code.
-  TheModule->print(errs(), nullptr);
+    // Run the main "interpreter loop" now.
+    MainLoop();
 
-  return 0;
+    // Print out all of the generated code.
+    TheModule->print(errs(), nullptr);
+
+    return 0;
 }
